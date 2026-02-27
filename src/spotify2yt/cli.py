@@ -178,6 +178,9 @@ def transfer(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Preview matching results without creating playlists"
     ),
+    retry: bool = typer.Option(
+        False, "--retry", help="Re-run the add phase (reset add count, keep matches)"
+    ),
 ):
     """Transfer a Spotify playlist to YouTube Music."""
     if not playlist and not all_playlists:
@@ -201,7 +204,7 @@ def transfer(
     # YouTube Music API are rejected, but unauthenticated search works fine.
     from ytmusicapi import YTMusic as _YTMusic
     matcher = SongMatcher(_YTMusic())
-    engine = TransferEngine(matcher, yt_client, dry_run=dry_run)
+    engine = TransferEngine(matcher, yt_client, dry_run=dry_run, retry=retry)
 
     if all_playlists:
         playlists = sp_client.get_playlists()

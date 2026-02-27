@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import requests
 from ytmusicapi import YTMusic
+from ytmusicapi.exceptions import YTMusicServerError
 
 logger = logging.getLogger(__name__)
 
@@ -78,19 +79,28 @@ class YouTubeMusicClient:
         video_ids: list[str],
         batch_size: int = 25,
         on_batch_done: Callable[[int], None] | None = None,
-    ) -> None:
+    ) -> int:
         added = 0
         for i in range(0, len(video_ids), batch_size):
             batch = video_ids[i : i + batch_size]
+            batch_added = 0
             for video_id in batch:
-                self._insert_playlist_item(playlist_id, video_id)
-            added += len(batch)
+                if self._insert_playlist_item(playlist_id, video_id):
+                    batch_added += 1
+            added += batch_added
+            skipped = len(batch) - batch_added
+            if skipped:
+                logger.info(
+                    "Batch %d–%d: added %d, skipped %d duplicates",
+                    i, i + len(batch) - 1, batch_added, skipped,
+                )
             if on_batch_done:
                 on_batch_done(added)
             if i + batch_size < len(video_ids):
                 time.sleep(0.5 + random.uniform(0, 0.3))
+        return added
 
-    def _insert_playlist_item(self, playlist_id: str, video_id: str) -> None:
+    def _insert_playlist_item(self, playlist_id: str, video_id: str) -> bool:
         for attempt in range(_MAX_RETRIES):
             try:
                 self._api_request(
@@ -107,10 +117,11 @@ class YouTubeMusicClient:
                         },
                     },
                 )
-                return
+                return True
             except requests.HTTPError as e:
                 if e.response is not None and e.response.status_code == 409:
-                    return  # duplicate, skip
+                    logger.debug("Skipped duplicate: %s", video_id)
+                    return False
                 if attempt == _MAX_RETRIES - 1:
                     raise RuntimeError(
                         f"Failed to add video {video_id} after {_MAX_RETRIES} retries: {e}"
@@ -121,6 +132,7 @@ class YouTubeMusicClient:
                     video_id, attempt + 1, _MAX_RETRIES, wait, e,
                 )
                 time.sleep(wait)
+        return False
 
 
 class YTMusicBrowserClient:
@@ -143,21 +155,54 @@ class YTMusicBrowserClient:
             raise RuntimeError(f"Failed to create playlist: {result}")
         return result
 
+    def _add_batch(self, playlist_id: str, batch: list[str]) -> int:
+        """Add a batch of video IDs, retrying on 409 with exponential backoff."""
+        for attempt in range(_MAX_RETRIES):
+            try:
+                result = self._yt.add_playlist_items(
+                    playlist_id, batch, duplicates=True
+                )
+                if isinstance(result, dict) and "SUCCEEDED" in result.get("status", ""):
+                    return len(result.get("playlistEditResults", []))
+                elif isinstance(result, dict) and result.get("status") == "STATUS_FAILED":
+                    logger.warning("Batch failed: %s", result.get("status"))
+                    return 0
+                return len(batch)
+            except YTMusicServerError as e:
+                if "409" in str(e):
+                    if attempt == _MAX_RETRIES - 1:
+                        logger.error("Batch failed after %d retries (409): %s", _MAX_RETRIES, e)
+                        return 0
+                    wait = 2 ** attempt + random.uniform(0, 1)
+                    logger.warning(
+                        "409 Conflict (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1, _MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+        return 0
+
     def add_tracks(
         self,
         playlist_id: str,
         video_ids: list[str],
         batch_size: int = 25,
         on_batch_done: Callable[[int], None] | None = None,
-    ) -> None:
+    ) -> int:
         added = 0
         for i in range(0, len(video_ids), batch_size):
             batch = video_ids[i : i + batch_size]
-            result = self._yt.add_playlist_items(playlist_id, batch)
-            if result and result.get("status") == "STATUS_FAILED":
-                logger.warning("Some tracks failed to add: %s", result)
-            added += len(batch)
+            batch_added = self._add_batch(playlist_id, batch)
+            added += batch_added
+            skipped = len(batch) - batch_added
+            if skipped:
+                logger.info(
+                    "Batch %d–%d: added %d, skipped %d duplicates",
+                    i, i + len(batch) - 1, batch_added, skipped,
+                )
             if on_batch_done:
                 on_batch_done(added)
             if i + batch_size < len(video_ids):
                 time.sleep(0.5 + random.uniform(0, 0.3))
+        return added

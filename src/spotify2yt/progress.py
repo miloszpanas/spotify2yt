@@ -21,10 +21,12 @@ class TransferEngine:
         matcher: SongMatcher,
         yt_client: YouTubeMusicClient,
         dry_run: bool = False,
+        retry: bool = False,
     ):
         self._matcher = matcher
         self._yt = yt_client
         self._dry_run = dry_run
+        self._retry = retry
 
     def transfer_playlist(self, playlist: Playlist, tracks: list[Track]) -> TransferProgress:
         progress_file = PROGRESS_DIR / f"{playlist.spotify_id}.json"
@@ -37,6 +39,11 @@ class TransferEngine:
             )
         else:
             state = self._load_or_create_progress(progress_file, playlist)
+            if self._retry and state.youtube_playlist_id:
+                console.print("[cyan]Retry mode: resetting add count to re-run add phase...[/cyan]")
+                state.tracks_added_to_yt = 0
+                state.completed = False
+                state.save(progress_file)
             if not state.youtube_playlist_id:
                 console.print(f"[bold]Creating YouTube Music playlist:[/bold] {playlist.name}")
                 state.youtube_playlist_id = self._yt.create_playlist(
@@ -108,6 +115,8 @@ class TransferEngine:
         remaining_ids = video_ids[state.tracks_added_to_yt:]
         if remaining_ids:
             already_added = state.tracks_added_to_yt
+            batch_size = 25
+            batches_done = 0
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -119,16 +128,27 @@ class TransferEngine:
                     "Adding tracks...", total=len(remaining_ids),
                 )
 
-                def _on_batch(count: int) -> None:
+                def _on_batch(actual_added: int) -> None:
+                    nonlocal batches_done
+                    batches_done += 1
+                    # actual_added is cumulative count of truly added tracks
                     self._update_added_count(
-                        state, progress_file, already_added + count
+                        state, progress_file, already_added + actual_added
                     )
-                    add_bar.update(add_task, completed=count)
+                    # Advance progress bar by total items attempted (for UX)
+                    attempted = min(batches_done * batch_size, len(remaining_ids))
+                    add_bar.update(add_task, completed=attempted)
 
-                self._yt.add_tracks(
+                actually_added = self._yt.add_tracks(
                     state.youtube_playlist_id,
                     remaining_ids,
                     on_batch_done=_on_batch,
+                )
+
+            skipped = len(remaining_ids) - actually_added
+            if skipped:
+                console.print(
+                    f"[yellow]{skipped} duplicate tracks were already on the playlist (skipped).[/yellow]"
                 )
 
         if state.unmatched_tracks:
